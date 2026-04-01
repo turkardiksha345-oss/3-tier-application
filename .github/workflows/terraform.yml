@@ -35,15 +35,9 @@ jobs:
     - name: Setup Terraform
       uses: hashicorp/setup-terraform@v3
 
-    # ✅ 4. Terraform Init with S3 Backend
+    # ✅ 4. Terraform Init
     - name: Terraform Init
-      run: |
-        if [ -n "${{ secrets.TF_STATE_BUCKET }}" ]; then
-          terraform init -backend-config="bucket=${{ secrets.TF_STATE_BUCKET }}" -backend-config="key=eks/terraform.tfstate" -backend-config="region=${{ env.AWS_REGION }}"
-        else
-          echo "Error: TF_STATE_BUCKET secret is not set! You must set a Terraform S3 Backend bucket in your GitHub Secrets to prevent pipeline state loss."
-          exit 1
-        fi
+      run: terraform init
       working-directory: Terraform-eks
 
     # 4. Terraform plan
