@@ -13,4 +13,9 @@ module "albc_irsa_role" {
   }
 }
 
-
+resource "aws_ec2_tag" "albc_subnets" {
+  for_each    = toset(data.aws_subnets.default_subnets.ids)
+  resource_id = each.value
+  key         = "kubernetes.io/role/elb"
+  value       = "1"
+}
