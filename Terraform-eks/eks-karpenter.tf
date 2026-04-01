@@ -9,6 +9,7 @@ module "karpenter" {
   enable_pod_identity             = false
   create_pod_identity_association = false
   
+  enable_irsa                     = true
   irsa_oidc_provider_arn          = aws_iam_openid_connect_provider.eks.arn
   irsa_namespace_service_accounts = ["kube-system:karpenter"]
 
