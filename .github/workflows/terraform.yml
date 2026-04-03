@@ -88,34 +88,56 @@ jobs:
     - uses: azure/setup-helm@v4
 
     # 13. Install ALB Controller (Stable)
-    - name: Install ALB Controller
+    - name: Install ALB Controller (FIXED)
       run: |
-        helm repo add eks https://aws.github.io/eks-charts
-        helm repo update
+       helm repo add eks https://aws.github.io/eks-charts
+       helm repo update
+ 
+       VPC_ID=$(aws eks describe-cluster \
+       --name $CLUSTER_NAME \
+       --region $AWS_REGION \
+       --query "cluster.resourcesVpcConfig.vpcId" \
+       --output text)
 
-        VPC_ID=$(aws eks describe-cluster \
-          --name $CLUSTER_NAME \
-          --region $AWS_REGION \
-          --query "cluster.resourcesVpcConfig.vpcId" \
-          --output text)
+       echo "Installing ALB Controller..."
 
-        helm upgrade --install aws-load-balancer-controller eks/aws-load-balancer-controller \
-          -n kube-system \
-          --set clusterName=$CLUSTER_NAME \
-          --set serviceAccount.create=false \
-          --set serviceAccount.name=aws-load-balancer-controller \
-          --set region=$AWS_REGION \
-          --set vpcId=$VPC_ID
+       helm upgrade --install aws-load-balancer-controller eks/aws-load-balancer-controller \
+       -n kube-system \
+       --set clusterName=$CLUSTER_NAME \
+       --set serviceAccount.create=false \
+       --set serviceAccount.name=aws-load-balancer-controller \
+       --set region=$AWS_REGION \
+       --set vpcId=$VPC_ID
 
-        kubectl rollout status deployment/aws-load-balancer-controller -n kube-system --timeout=300s
+       echo "Checking pods..."
 
-        for i in {1..30}; do
-          EP=$(kubectl get endpoints aws-load-balancer-webhook-service -n kube-system -o jsonpath='{.subsets}' || echo "")
-          if [ ! -z "$EP" ]; then
-            break
-          fi
-          sleep 10
-        done
+       sleep 20
+
+       kubectl get pods -n kube-system | grep aws-load-balancer-controller || true
+
+       echo "Waiting for pods to be READY..."
+
+       for i in {1..40}; do
+       READY=$(kubectl get deployment aws-load-balancer-controller -n kube-system -o jsonpath='{.status.readyReplicas}' 2>/dev/null || echo "0")
+
+       if [ "$READY" == "2" ]; then
+        echo "✅ ALB Controller is READY"
+        break
+       fi
+
+       echo "Still waiting... ($i)"
+       sleep 10
+       done
+
+       echo "===== DEBUG ====="
+       kubectl get pods -n kube-system
+       kubectl describe deployment aws-load-balancer-controller -n kube-system || true
+       kubectl logs -n kube-system deployment/aws-load-balancer-controller || true
+
+       if [ "$READY" != "2" ]; then
+         echo "❌ ALB Controller failed"
+        exit 1
+       fi
 
     # 14. Delay (critical)
     - run: sleep 30
