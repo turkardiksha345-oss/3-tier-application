@@ -16,15 +16,14 @@ permissions:
 jobs:
   deploy:
     runs-on: ubuntu-latest
-    timeout-minutes: 25
+    timeout-minutes: 30
 
     steps:
 
     # 1. Checkout
-    - name: Checkout Code
-      uses: actions/checkout@v4
+    - uses: actions/checkout@v4
 
-    # 2. AWS Login (OIDC)
+    # 2. AWS Login
     - name: Configure AWS Credentials
       uses: aws-actions/configure-aws-credentials@v4
       with:
@@ -32,25 +31,17 @@ jobs:
         aws-region: ${{ env.AWS_REGION }}
 
     # 3. Terraform Setup
-    - name: Setup Terraform
-      uses: hashicorp/setup-terraform@v3
+    - uses: hashicorp/setup-terraform@v3
 
     # 4. Terraform Init
-    - name: Terraform Init
-      run: terraform init
+    - run: terraform init
       working-directory: Terraform-eks
 
-    # 5. Terraform Plan
-    - name: Terraform Plan
-      run: terraform plan
+    # 5. Terraform Apply
+    - run: terraform apply -auto-approve
       working-directory: Terraform-eks
 
-    # 6. Terraform Apply
-    - name: Terraform Apply
-      run: terraform apply -auto-approve
-      working-directory: Terraform-eks
-
-    # 7. Get Outputs
+    # 6. Get Outputs
     - name: Get IAM Outputs
       run: |
         echo "ALBC_ROLE=$(terraform output -raw albc_iam_role_arn)" >> $GITHUB_ENV
@@ -58,48 +49,46 @@ jobs:
         echo "KARPENTER_QUEUE=$(terraform output -raw karpenter_queue_name)" >> $GITHUB_ENV
       working-directory: Terraform-eks
 
-    # 8. Docker Login
-    - name: Login to Docker Hub
-      run: echo "${{ secrets.DOCKER_PASSWORD }}" | docker login -u "${{ secrets.DOCKER_USERNAME }}" --password-stdin
+    # 7. Docker Login
+    - run: echo "${{ secrets.DOCKER_PASSWORD }}" | docker login -u "${{ secrets.DOCKER_USERNAME }}" --password-stdin
 
-    # 9. Build Backend
+    # 8. Build Images
     - name: Build Backend
       run: |
         docker build -t ${{ secrets.DOCKER_USERNAME }}/easy-crud-backend:latest ./Application/backend
         docker push ${{ secrets.DOCKER_USERNAME }}/easy-crud-backend:latest
 
-    # 10. Build Frontend
     - name: Build Frontend
       run: |
         docker build -t ${{ secrets.DOCKER_USERNAME }}/easy-crud-frontend:latest ./Application/frontend
         docker push ${{ secrets.DOCKER_USERNAME }}/easy-crud-frontend:latest
 
-    # 11. Install kubectl
-    - name: Install kubectl
-      run: |
+    # 9. Install kubectl
+    - run: |
         curl -o kubectl https://s3.us-west-2.amazonaws.com/amazon-eks/1.29.0/2024-01-04/bin/linux/amd64/kubectl
         chmod +x kubectl
         sudo mv kubectl /usr/local/bin/
 
-    # 12. Connect to EKS
-    - name: Update kubeconfig
-      run: aws eks update-kubeconfig --region $AWS_REGION --name $CLUSTER_NAME
+    # 10. Connect to EKS
+    - run: aws eks update-kubeconfig --region $AWS_REGION --name $CLUSTER_NAME
 
-    # 13. Wait for Nodes
+    # 11. Wait for Nodes
     - name: Wait for Nodes
       run: |
-        for i in {1..30}; do
-          kubectl get nodes && break
-          echo "Waiting for nodes..."
+        for i in {1..60}; do
+          READY=$(kubectl get nodes --no-headers 2>/dev/null | grep -c " Ready")
+          if [ "$READY" -ge 1 ]; then
+            kubectl get nodes
+            break
+          fi
           sleep 10
         done
 
-    # 14. Install Helm
-    - name: Install Helm
-      uses: azure/setup-helm@v4
+    # 12. Install Helm
+    - uses: azure/setup-helm@v4
 
-    # 15. Install AWS Load Balancer Controller
-    - name: Install AWS Load Balancer Controller
+    # 13. Install ALB Controller (Stable)
+    - name: Install ALB Controller
       run: |
         helm repo add eks https://aws.github.io/eks-charts
         helm repo update
@@ -118,20 +107,21 @@ jobs:
           --set region=$AWS_REGION \
           --set vpcId=$VPC_ID
 
-        echo "Waiting for controller..."
+        kubectl rollout status deployment/aws-load-balancer-controller -n kube-system --timeout=300s
 
-        for i in {1..40}; do
-          READY=$(kubectl get deployment aws-load-balancer-controller -n kube-system -o jsonpath='{.status.readyReplicas}')
-          if [ "$READY" == "2" ]; then
-            echo "Controller ready!"
+        for i in {1..30}; do
+          EP=$(kubectl get endpoints aws-load-balancer-webhook-service -n kube-system -o jsonpath='{.subsets}' || echo "")
+          if [ ! -z "$EP" ]; then
             break
           fi
           sleep 10
         done
 
-    # 16. Create Karpenter ServiceAccount (FIX)
-    - name: Create Karpenter ServiceAccount
-      run: |
+    # 14. Delay (critical)
+    - run: sleep 30
+
+    # 15. Create Karpenter SA
+    - run: |
         kubectl apply -f - <<EOF
         apiVersion: v1
         kind: ServiceAccount
@@ -142,63 +132,37 @@ jobs:
             eks.amazonaws.com/role-arn: ${KARPENTER_ROLE}
         EOF
 
-    # 17. Install Karpenter
-    - name: Install Karpenter
-      run: |
+    # 16. Install Karpenter
+    - run: |
         aws ecr-public get-login-password --region us-east-1 | helm registry login --username AWS --password-stdin public.ecr.aws
 
         helm upgrade --install karpenter oci://public.ecr.aws/karpenter/karpenter \
           --version 1.0.0 \
           --namespace kube-system \
-          --create-namespace \
           --set settings.clusterName=${CLUSTER_NAME} \
           --set settings.interruptionQueue=${KARPENTER_QUEUE} \
           --set serviceAccount.create=false \
           --set serviceAccount.name=karpenter
 
-    # 18. Install KEDA
-    - name: Install KEDA
-      run: |
+        kubectl rollout status deployment/karpenter -n kube-system --timeout=300s
+
+    # 17. Install KEDA
+    - run: |
         helm repo add kedacore https://kedacore.github.io/charts
         helm repo update
         helm upgrade --install keda kedacore/keda --namespace keda --create-namespace
 
-    # 19. Install ArgoCD
-    - name: Install ArgoCD
-      run: |
+    # 18. Install ArgoCD
+    - run: |
         kubectl create namespace argocd || true
-
         kubectl apply -n argocd -f https://raw.githubusercontent.com/argoproj/argo-cd/stable/manifests/install.yaml
+        kubectl wait --for=condition=Available deployment/argocd-server -n argocd --timeout=300s
 
-        echo "Waiting for ArgoCD..."
-
-        for i in {1..40}; do
-          READY=$(kubectl get pods -n argocd --no-headers | grep Running | wc -l)
-          if [ "$READY" -ge 5 ]; then
-            echo "ArgoCD Ready!"
-            break
-          fi
-          sleep 10
-        done
-
-    # 20. Expose ArgoCD
-    - name: Expose ArgoCD
-      run: |
-        kubectl patch svc argocd-server -n argocd \
-          -p '{"spec": {"type": "LoadBalancer"}}'
-
+    # 19. Expose ArgoCD
+    - run: |
+        kubectl patch svc argocd-server -n argocd -p '{"spec": {"type": "LoadBalancer"}}'
         sleep 30
         kubectl get svc argocd-server -n argocd
 
-    # 21. Get ArgoCD Password
-    - name: Get ArgoCD Password
-      run: |
-        echo "Username: admin"
-        kubectl -n argocd get secret argocd-initial-admin-secret \
-          -o jsonpath="{.data.password}" | base64 -d
-
-    # 22. Deploy via ArgoCD (GitOps)
-    - name: Deploy via ArgoCD
-      run: |
-        kubectl apply -f argocd/
-        
+    # 20. Deploy via ArgoCD
+    - run: kubectl apply -f argocd/
