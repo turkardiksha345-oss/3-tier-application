@@ -139,15 +139,15 @@ jobs:
     # 16. Install Karpenter
     - name: Install Karpenter
       run: |
-        aws ecr-public get-login-password --region us-east-1 | helm registry login --username AWS --password-stdin public.ecr.aws
+       aws ecr-public get-login-password --region us-east-1 | helm registry login --username AWS --password-stdin public.ecr.aws
 
-        helm upgrade --install karpenter oci://public.ecr.aws/karpenter/karpenter \
-          --version 1.0.0 \
-          --namespace kube-system \
-          --create-namespace \
-          --set settings.clusterName=${CLUSTER_NAME} \
-          --set settings.interruptionQueue=${KARPENTER_QUEUE} \
-          --set serviceAccount.annotations.eks\.amazonaws\.com/role-arn=${KARPENTER_ROLE}
+       helm upgrade --install karpenter oci://public.ecr.aws/karpenter/karpenter \
+       --version 1.0.0 \
+       --namespace kube-system \
+       --create-namespace \
+       --set settings.clusterName=${CLUSTER_NAME} \
+       --set settings.interruptionQueue=${KARPENTER_QUEUE} \
+       --set-string serviceAccount.annotations."eks.amazonaws.com/role-arn"=${KARPENTER_ROLE}
 
     # 17. Install KEDA
     - name: Install KEDA
