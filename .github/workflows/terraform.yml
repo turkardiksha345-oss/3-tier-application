@@ -9,7 +9,6 @@ env:
   AWS_REGION: eu-north-1
   CLUSTER_NAME: my-cluster
 
-# Needed for GitHub Actions OIDC Authentication
 permissions:
   id-token: write
   contents: read
@@ -17,129 +16,147 @@ permissions:
 jobs:
   deploy:
     runs-on: ubuntu-latest
+    timeout-minutes: 25
 
     steps:
 
-    # ✅ 1. Checkout Code
+    # 1. Checkout
     - name: Checkout Code
       uses: actions/checkout@v4
 
-    # ✅ 2. Configure AWS Credentials via OIDC
+    # 2. AWS OIDC Login
     - name: Configure AWS Credentials
       uses: aws-actions/configure-aws-credentials@v4
       with:
         role-to-assume: ${{ secrets.AWS_OIDC_ROLE }}
         aws-region: ${{ env.AWS_REGION }}
 
-    # ✅ 3. Setup Terraform
+    # 3. Terraform Setup
     - name: Setup Terraform
       uses: hashicorp/setup-terraform@v3
 
-    # ✅ 4. Terraform Init
+    # 4. Terraform Init
     - name: Terraform Init
       run: terraform init
       working-directory: Terraform-eks
 
-    # 4. Terraform plan
+    # 5. Terraform Plan
     - name: Terraform Plan
       run: terraform plan
       working-directory: Terraform-eks
 
-    # ✅ 5. Terraform Apply (Create EKS)
+    # 6. Terraform Apply
     - name: Terraform Apply
       run: terraform apply -auto-approve
       working-directory: Terraform-eks
 
-    # ✅ 6. Fetch Terraform Outputs for Helm
+    # 7. Get Outputs
     - name: Get IAM Role ARNs
-      id: tf-outputs
       run: |
-        ALBC_ROLE=$(terraform output -raw albc_iam_role_arn)
-        KARPENTER_ROLE=$(terraform output -raw karpenter_iam_role_arn)
-        KARPENTER_QUEUE=$(terraform output -raw karpenter_queue_name)
-        echo "ALBC_ROLE=$ALBC_ROLE" >> $GITHUB_ENV
-        echo "KARPENTER_ROLE=$KARPENTER_ROLE" >> $GITHUB_ENV
-        echo "KARPENTER_QUEUE=$KARPENTER_QUEUE" >> $GITHUB_ENV
+        echo "ALBC_ROLE=$(terraform output -raw albc_iam_role_arn)" >> $GITHUB_ENV
+        echo "KARPENTER_ROLE=$(terraform output -raw karpenter_iam_role_arn)" >> $GITHUB_ENV
+        echo "KARPENTER_QUEUE=$(terraform output -raw karpenter_queue_name)" >> $GITHUB_ENV
       working-directory: Terraform-eks
 
-    # ✅ 7. Login to Docker Hub
+    # 8. Docker Login
     - name: Login to Docker Hub
       run: echo "${{ secrets.DOCKER_PASSWORD }}" | docker login -u "${{ secrets.DOCKER_USERNAME }}" --password-stdin
 
-    # ✅ 8. Build & Push Backend Image
-    - name: Build & Push Backend
+    # 9. Build & Push Backend
+    - name: Build Backend
       run: |
         docker build -t ${{ secrets.DOCKER_USERNAME }}/easy-crud-backend:latest ./Application/backend
         docker push ${{ secrets.DOCKER_USERNAME }}/easy-crud-backend:latest
 
-    # ✅ 9. Build & Push Frontend Image
-    - name: Build & Push Frontend
+    # 10. Build & Push Frontend
+    - name: Build Frontend
       run: |
         docker build -t ${{ secrets.DOCKER_USERNAME }}/easy-crud-frontend:latest ./Application/frontend
         docker push ${{ secrets.DOCKER_USERNAME }}/easy-crud-frontend:latest
 
-     # Install kubectl
+    # 11. Install kubectl
     - name: Install kubectl
       run: |
         curl -o kubectl https://s3.us-west-2.amazonaws.com/amazon-eks/1.29.0/2024-01-04/bin/linux/amd64/kubectl
         chmod +x kubectl
         sudo mv kubectl /usr/local/bin/
 
-    # ✅ 10. Update kubeconfig (Connect to EKS)
+    # 12. Connect to EKS
     - name: Update kubeconfig
-      run: |
-        aws eks update-kubeconfig --region $AWS_REGION --name $CLUSTER_NAME
+      run: aws eks update-kubeconfig --region $AWS_REGION --name $CLUSTER_NAME
 
-    # ✅ 11. Wait for Nodes to automatically join the cluster
+    # 13. Wait for Nodes
     - name: Wait for Nodes
       run: |
-        echo "Waiting for EC2 instances to fully boot and register with Kubernetes..."
         for i in {1..30}; do
           kubectl get nodes && break
-          echo "No nodes yet, waiting 10 seconds..."
+          echo "Waiting for nodes..."
           sleep 10
         done
 
-    # ✅ 12. Install Helm
+    # 14. Install Helm
     - name: Install Helm
       uses: azure/setup-helm@v4
-      with:
-        version: v3.14.0
 
-    # ✅ 12. Install AWS Load Balancer Controller via Helm
+    # 🔥 15. FIXED AWS LOAD BALANCER CONTROLLER
     - name: Install AWS Load Balancer Controller
       run: |
         helm repo add eks https://aws.github.io/eks-charts
         helm repo update
+
+        VPC_ID=$(aws eks describe-cluster \
+          --name $CLUSTER_NAME \
+          --region $AWS_REGION \
+          --query "cluster.resourcesVpcConfig.vpcId" \
+          --output text)
+
         helm upgrade --install aws-load-balancer-controller eks/aws-load-balancer-controller \
           -n kube-system \
           --set clusterName=$CLUSTER_NAME \
-          --set serviceAccount.create=true \
+          --set serviceAccount.create=false \
           --set serviceAccount.name=aws-load-balancer-controller \
-          --set serviceAccount.annotations.eks\\.amazonaws\\.com/role-arn=$ALBC_ROLE
-          
-        echo "Waiting for AWS Load Balancer Controller Webhook to be ready..."
-        sleep 10
-        kubectl rollout status deployment aws-load-balancer-controller -n kube-system --timeout=120s
+          --set region=$AWS_REGION \
+          --set vpcId=$VPC_ID
 
-    # ✅ 13. Install Karpenter via Helm
+        echo "Waiting for controller..."
+
+        for i in {1..40}; do
+          READY=$(kubectl get deployment aws-load-balancer-controller -n kube-system -o jsonpath='{.status.readyReplicas}')
+          
+          if [ "$READY" == "2" ]; then
+            echo "Controller ready!"
+            break
+          fi
+
+          echo "Still waiting..."
+          sleep 10
+        done
+
+        echo "===== DEBUG INFO ====="
+        kubectl get pods -n kube-system
+        kubectl logs -n kube-system deployment/aws-load-balancer-controller || true
+
+    # 16. Install Karpenter
     - name: Install Karpenter
       run: |
-        # Helm registry login for ECR Public requires standard AWS auth
         aws ecr-public get-login-password --region us-east-1 | helm registry login --username AWS --password-stdin public.ecr.aws
-        helm upgrade --install karpenter oci://public.ecr.aws/karpenter/karpenter --version 1.0.0 --namespace kube-system --create-namespace \
-          --set "settings.clusterName=${CLUSTER_NAME}" \
-          --set "settings.interruptionQueue=${KARPENTER_QUEUE}" \
-          --set "serviceAccount.annotations.eks\.amazonaws\.com/role-arn=${KARPENTER_ROLE}"
 
-    # ✅ 14. Install KEDA via Helm
+        helm upgrade --install karpenter oci://public.ecr.aws/karpenter/karpenter \
+          --version 1.0.0 \
+          --namespace kube-system \
+          --create-namespace \
+          --set settings.clusterName=${CLUSTER_NAME} \
+          --set settings.interruptionQueue=${KARPENTER_QUEUE} \
+          --set serviceAccount.annotations.eks\.amazonaws\.com/role-arn=${KARPENTER_ROLE}
+
+    # 17. Install KEDA
     - name: Install KEDA
       run: |
         helm repo add kedacore https://kedacore.github.io/charts
         helm repo update
         helm upgrade --install keda kedacore/keda --namespace keda --create-namespace
 
-    # ✅ 15. Deploy to Kubernetes
+    # 18. Deploy App
     - name: Deploy Application
       run: |
         kubectl apply -f Application/yaml/
