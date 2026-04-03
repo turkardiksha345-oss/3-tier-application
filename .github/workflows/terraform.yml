@@ -90,7 +90,17 @@ jobs:
       run: |
         aws eks update-kubeconfig --region $AWS_REGION --name $CLUSTER_NAME
 
-    # ✅ 11. Install Helm
+    # ✅ 11. Wait for Nodes to automatically join the cluster
+    - name: Wait for Nodes
+      run: |
+        echo "Waiting for EC2 instances to fully boot and register with Kubernetes..."
+        for i in {1..30}; do
+          kubectl get nodes && break
+          echo "No nodes yet, waiting 10 seconds..."
+          sleep 10
+        done
+
+    # ✅ 12. Install Helm
     - name: Install Helm
       uses: azure/setup-helm@v4
       with:
